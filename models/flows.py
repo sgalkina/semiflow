@@ -64,6 +64,18 @@ class ConditionalFlow(Flow):
         return self.f(x, y)
 
 
+class DiscreteConditionalFlowNoEmb(ConditionalFlow):
+    def __init__(self, modules, num_cat, emb_dim):
+        super().__init__(modules)
+        # self.embeddings = nn.Linear(num_cat, emb_dim)
+
+    def f(self, x, y):
+        return super().f(x, y)
+
+    def g(self, z, y):
+        return super().g(z, y)
+
+
 class DiscreteConditionalFlow(ConditionalFlow):
     def __init__(self, modules, num_cat, emb_dim):
         super().__init__(modules)
@@ -145,6 +157,41 @@ class DiscreteConditionalFlowPDF(DeepConditionalFlowPDF):
     def log_prob_posterior(self, x):
         logp_joint = self.log_prob_full(x)
         return logp_joint - torch.logsumexp(logp_joint, dim=1)[:, None]
+
+
+class ArbitraryConditionalPrior(object):
+    def __init__(self, counts, device):
+        self.counts = counts
+        self.n_classes = counts.shape[0]
+        self.conditional = torch.distributions.Categorical(probs=torch.FloatTensor(self.counts/self.counts.sum()).to(device))
+
+    def enumerate_support(self):
+        labels_tensor = torch.tensor(range(self.n_classes))
+        one_hot_vectors = torch.nn.functional.one_hot(labels_tensor, num_classes=self.n_classes)
+        return one_hot_vectors
+
+    def log_prob(self, value):
+        return self.conditional.log_prob(value.argmax(axis=1))
+
+
+class ArbitraryConditionalFlowPDF(DiscreteConditionalFlowPDF):
+    def __init__(self, flow, deep_prior, yprior, deep_dim, shallow_prior=None):
+        super().__init__(flow, deep_prior, yprior, deep_dim, shallow_prior=shallow_prior)
+        self.flow = flow
+        self.shallow_prior = shallow_prior
+        self.deep_prior = deep_prior
+        self.yprior = yprior
+        self.deep_dim = deep_dim
+
+    def log_prob_full(self, x):
+        sup = self.yprior.enumerate_support().to(x.device)
+
+        n_uniq = sup.size(0)
+        N = x.size(0)
+        y = sup.repeat((1, N)).reshape((N*n_uniq, -1))
+        y = y.clone().detach().float().requires_grad_(True)
+        logp = self.log_prob(x.repeat([n_uniq] + [1]*(len(x.shape)-1)), y)
+        return logp.reshape((n_uniq, x.size(0))).t() + self.yprior.log_prob(sup[None])
 
 
 class ResNetBlock(nn.Module):
@@ -345,7 +392,8 @@ def get_flow_cond(num_layers, k_factor, in_channels=1, hid_dim=256, conv='full',
             channels //= 2
             channels -= channels % 2
 
-    return DiscreteConditionalFlow(modules, num_cat, emb_dim)
+    # return DiscreteConditionalFlow(modules, num_cat, emb_dim)
+    return DiscreteConditionalFlowNoEmb(modules, num_cat, emb_dim)
 
 
 def mnist_flow(num_layers=5, k_factor=4, logits=True, conv='full', hh_factors=2, hid_dim=[32, 784]):

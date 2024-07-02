@@ -95,11 +95,15 @@ deep_prior = distributions.GaussianDiag(args.ssl_dim)
 shallow_prior = distributions.GaussianDiag(dim - args.ssl_dim)
 
 _, c = np.unique(trainloader.dataset.targets[trainloader.dataset.targets != -1], return_counts=True)
-yprior = torch.distributions.Categorical(probs=torch.FloatTensor(c/c.sum()).to(device))
+# yprior = torch.distributions.Categorical(probs=torch.FloatTensor(c/c.sum()).to(device))
+yprior = flows.ArbitraryConditionalPrior(counts=torch.FloatTensor(c/c.sum()), device=device)
 ssl_flow = utils.create_cond_flow(args)
 # ssl_flow = torch.nn.DataParallel(ssl_flow.to(device))
 ssl_flow.to(device)
-prior = flows.DiscreteConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+
+# prior = flows.DiscreteConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+#                                          shallow_prior=shallow_prior)
+prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
                                          shallow_prior=shallow_prior)
 
 flow = utils.create_flow(args, data_shape)
@@ -145,7 +149,10 @@ for epoch in range(1, args.epochs + 1):
         if n_sup != z.shape[0]:
             log_prior[y == -1] = model.prior.log_prob(z[y == -1])
         if n_sup != 0:
-            log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y[y != -1].to(x.device))
+            y_sup_onehot = torch.nn.functional.one_hot(y[y != -1].to(x.device), num_classes=len(c))
+            y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
+            log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y_sup)
+            # log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y[y != -1].to(x.device))
         elbo = log_det + log_prior
 
         weights = torch.ones((elbo.size(0),)).to(elbo)
