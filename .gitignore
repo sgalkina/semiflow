@@ -129,4 +129,9 @@ dmypy.json
 .pyre/
 
 MNIST/
+MNIST-SVHN/
 logs/
+*.pdf
+*.out
+wandb/
+multivae_logs/

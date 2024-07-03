@@ -123,6 +123,58 @@ def load_dataset(data, train_bs, test_bs, num_examples=None, data_root=DATA_ROOT
     return trainloader, testloader, data_shape, bits
 
 
+def load_mnist_svhn_dataset(data, train_bs, test_bs, num_examples=None, data_root=DATA_ROOT, shuffle=True,
+                 seed=42, supervised=-1, logs_root='', sup_sample_weight=-1, sup_only=False, device=None):
+    bits = None
+    sampler = None
+
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        UniformNoise(),
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        UniformNoise(),
+    ])
+    trainset = torchvision.datasets.MNIST(root=data_root, train=True, download=True, transform=train_transform)
+    testset = torchvision.datasets.MNIST(root=data_root, train=False, download=True, transform=test_transform)
+
+    if num_examples != -1 and num_examples != len(trainset) and num_examples is not None:
+        idxs, _ = train_test_split(np.arange(len(trainset)), train_size=num_examples, random_state=seed,
+                                    stratify=utils.tonp(trainset.targets))
+        trainset.data = trainset.data[idxs]
+        trainset.targets = trainset.targets[idxs]
+
+    if supervised == 0:
+        trainset.targets[:] = -1
+    elif supervised != -1:
+        unsupervised_idxs, _ = train_test_split(np.arange(len(trainset.targets)),
+                                                test_size=supervised, stratify=trainset.targets)
+        trainset.targets[unsupervised_idxs] = -1
+
+    if sup_only:
+        mask = trainset.targets != -1
+        trainset.targets = trainset.targets[mask]
+        trainset.data = trainset.data[mask]
+
+    data_shape = (1, 28, 28)
+    bits = 256
+
+    nw = 2
+    if sup_sample_weight == -1:
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=train_bs, shuffle=shuffle,
+                                                  num_workers=nw, pin_memory=True)
+    else:
+        sampler = ImbalancedDatasetSampler(trainset, sup_weight=sup_sample_weight)
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=train_bs, sampler=sampler,
+                                                  num_workers=nw, pin_memory=True)
+
+    testloader = torch.utils.data.DataLoader(testset, batch_size=test_bs, shuffle=False,
+                                             num_workers=nw, pin_memory=True)
+    return trainloader, testloader, data_shape, bits
+
+
 class ImbalancedDatasetSampler(torch.utils.data.sampler.Sampler):
     """Samples elements randomly from a given list of indices for imbalanced dataset
     https://github.com/ufoym/imbalanced-dataset-sampler/blob/master/sampler.py

@@ -11,6 +11,7 @@ import warnings
 import torch.nn.functional as F
 import argparse
 import matplotlib.pyplot as plt
+import timm
 
 
 def get_metrics(model, loader):
@@ -133,78 +134,51 @@ if args.pretrained != '':
     # model.load_state_dict(torch.load(os.path.join(args.pretrained, 'model.torch')))
     # optimizer.load_state_dict(torch.load(os.path.join(args.pretrained, 'optimizer.torch')))
 
-t0 = time.time()
-for epoch in range(1, args.epochs + 1):
-    train_loss = 0.
-    train_acc = utils.MovingMetric()
-    train_elbo = utils.MovingMetric()
-    train_cl = utils.MovingMetric()
+# Pretrained MNIST classifier
+clf = timm.create_model("resnet18", pretrained=False, num_classes=10)
+clf.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+clf.load_state_dict(
+  torch.hub.load_state_dict_from_url(
+    "https://huggingface.co/gpcarl123/resnet18_mnist/resolve/main/resnet18_mnist.pth",
+    map_location=device,
+    file_name="resnet18_mnist.pth",
+  )
+)
+clf = clf.to(device)
 
-    for x, y in trainloader:
-        x = x.to(device)
-        n_sup = (y != -1).sum().item()
+for x, y in trainloader:
+    x = x.to(device)
+    n_sup = (y != -1).sum().item()
 
-        log_det, z = model.flow(x)
+    # hack, because f(...) needed before the g(...)
+    model.eval()
+    log_det, z = model.flow(x)
+    log_prior = torch.ones((x.size(0),)).to(x.device)
+    if n_sup != z.shape[0]:
+        log_prior[y == -1] = model.prior.log_prob(z[y == -1])
+    if n_sup != 0:
+        y_sup_onehot = torch.nn.functional.one_hot(y[y != -1].to(x.device), num_classes=len(c))
+        y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
+        log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y_sup)
+    # end of hack, because f(...) needed before the g(...)
 
-        log_prior = torch.ones((x.size(0),)).to(x.device)
-        if n_sup != z.shape[0]:
-            log_prior[y == -1] = model.prior.log_prob(z[y == -1])
-        if n_sup != 0:
-            y_sup_onehot = torch.nn.functional.one_hot(y[y != -1].to(x.device), num_classes=len(c))
-            y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
-            log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y_sup)
-            # log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y[y != -1].to(x.device))
-        elbo = log_det + log_prior
-
-        weights = torch.ones((elbo.size(0),)).to(elbo)
-        weights[y != -1] = args.sup_weight
-        weights /= weights.sum()
-
-        gen_loss = -(elbo * weights.detach()).sum()
-
-        cl_loss = 0
-        if n_sup != 0:
-            logp_full = model.prior.log_prob_full(z[y != -1])
-            prediction = logp_full
-            train_acc.add(utils.tonp(prediction.argmax(1).to(y) == y[y != -1]))
-            if args.cl_weight != 0:
-                cl_loss = F.cross_entropy(prediction, y[y != -1].to(prediction.device), reduction='none')
-                train_cl.add(utils.tonp(cl_loss))
-                cl_loss = cl_loss.mean()
-
-        loss = gen_loss + args.cl_weight * cl_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        train_elbo.add(utils.tonp(elbo))
-        train_loss += loss.item() * x.size(0)
-
-    train_loss /= len(trainloader.dataset)
-    lr_scheduler.step()
-
-    y_test = y_sup[:4]
+    y_test = y_sup[:64]
     numbers = '_'.join(list(map(str, y_test.argmax(1).tolist())))
-    x_test = model.conditional_sample(y_test, device=device).detach().cpu().numpy()
+    x_res = model.conditional_sample(y_test, device=device)
+    x_test = x_res.detach().cpu().numpy()
     if not np.any(np.isnan(x_test)):
-        plt.imshow(utils.viz_array_grid(x_test, 2, 2))
-        plt.savefig(f"{numbers}.pdf")
+        plt.imshow(utils.viz_array_grid(x_test, 8, 8))
+        plt.savefig(f"train_eval.pdf")
+    print('Train accuracy for 64 samples:', sum(clf(x_res).argmax(1) == y_test.argmax(1)).tolist() / 64)
+    break
 
-    if epoch % args.log_each == 0 or epoch == 1:
-        with torch.no_grad():
-            test_logp, test_acc = get_metrics(model, testloader)
-        logger.add_scalar(epoch, 'train.loss', train_loss)
-        logger.add_scalar(epoch, 'train.elbo', train_elbo.avg())
-        logger.add_scalar(epoch, 'train.cl', train_cl.avg())
-        logger.add_scalar(epoch, 'train.acc', train_acc.avg())
-        logger.add_scalar(epoch, 'test.logp', test_logp)
-        logger.add_scalar(epoch, 'test.acc', test_acc)
-        logger.add_scalar(epoch, 'test.bits/dim', utils.bits_dim(test_logp, dim, bits))
-        logger.add_scalar(epoch, 'time', time.time() - t0)
-        t0 = time.time()
-        logger.iter_info()
-        logger.save()
+correct, count = 0, 0
+for x, y in testloader:
+    x = x.to(device)
+    y_sup_onehot = torch.nn.functional.one_hot(y[y != -1].to(x.device), num_classes=len(c))
+    y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
+    x_res = model.conditional_sample(y_sup, device=device)
+    correct += sum(clf(x_res).argmax(1) == y_sup.argmax(1)).tolist()
+    count += len(y_sup.argmax(1).tolist())
 
-        torch.save(model.state_dict(), os.path.join(args.root, 'model.torch'))
-        torch.save(optimizer.state_dict(), os.path.join(args.root, 'optimizer.torch'))
+print('Total test accuracy:', correct / count)

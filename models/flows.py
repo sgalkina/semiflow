@@ -101,6 +101,20 @@ class FlowPDF(nn.Module):
     def log_prob(self, x):
         log_det, z = self.flow(x)
         return log_det + self.prior.log_prob(z)
+    
+    def conditional_sample(self, y, device):
+        N = y.shape[0]
+        H = 196
+        M = 784
+        mean1 = self.prior.deep_prior.mean
+        sigma1 = torch.exp(self.prior.deep_prior.logsigma)
+        z_h = torch.normal(mean1.repeat([N, 1]), sigma1.repeat([N, 1])).to(device)
+        z_f = self.prior.flow.g(z_h, y)[:, :, 0, 0]
+        mean2 = self.prior.shallow_prior.mean
+        sigma2 = torch.exp(self.prior.shallow_prior.logsigma)
+        z_aux = torch.normal(mean2.repeat([N, 1]), sigma2.repeat([N, 1])).to(device)
+        x = self.flow.module.g(torch.cat([z_aux, z_f], 1))
+        return x
 
 
 class DeepConditionalFlowPDF(nn.Module):

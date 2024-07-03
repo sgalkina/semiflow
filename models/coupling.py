@@ -177,8 +177,6 @@ class ConditionalCouplingLayer(CouplingLayer):
         assert y.dim() == 2
         y = y[..., None, None].repeat((1, 1, x1.shape[2], x1.shape[3]))
 
-        # print(y)
-
         x1 = coupling(x1, torch.cat([x2, y], dim=1), self.net1, log_det_jac)
         x2 = coupling(x2, torch.cat([x1, y], dim=1), self.net2, log_det_jac)
 
