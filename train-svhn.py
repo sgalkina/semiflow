@@ -11,11 +11,13 @@ from multivae.models import MMVAE, MMVAEConfig, MMVAEPlus, MMVAEPlusConfig, MVAE
 from multivae.models import MVTCAE, MVTCAEConfig, MoPoE, MoPoEConfig
 from multivae.models.base import BaseMultiVAEConfig
 from multivae.trainers import BaseTrainer, BaseTrainerConfig
+from multivae.data.datasets import IncompleteDataset, DatasetOutput
 from multivae.trainers.base.callbacks import (
     ProgressBarCallback,
     TrainingCallback,
     WandbCallback,
 )
+import utils
 
 ############ Define the architectures ##############
 
@@ -151,30 +153,36 @@ test_set = MnistSvhn(data_path = DATA_PATH, split="test", data_multiplication=1,
 #######################################################
 ########### Incomplete dataset ########################
 
-from multivae.data.datasets import IncompleteDataset, DatasetOutput
-import torch
 
-L = len(train_set)
 
-# Define random data samples
-data = dict(
-    mnist = torch.stack([b['data']['mnist'] for b in train_set]),
-    svhn = torch.stack([b['data']['svhn'] for b in train_set])
-)
-# Define random masks : masks are boolean tensors: True indicates the modality is available. 
-masks = dict(
-    mnist = torch.ones((L,)).bool(),
-    svhn = torch.ones((L,)).bool()
-)
-# Arbitrary labels (optional)
-labels = torch.stack([b['labels'] for b in train_set])
+# L = len(train_set)
 
-incomplete_dataset = IncompleteDataset(data, masks, labels)
+# # Define random data samples
+# data = dict(
+#     mnist = torch.stack([b['data']['mnist'] for b in train_set]),
+#     svhn = torch.stack([b['data']['svhn'] for b in train_set])
+# )
+# # Define random masks : masks are boolean tensors: True indicates the modality is available. 
+# masks = dict(
+#     mnist = torch.ones((L,)).bool(),
+#     svhn = torch.ones((L,)).bool()
+# )
+# # Arbitrary labels (optional)
+# labels = torch.stack([b['labels'] for b in train_set])
+
+# incomplete_dataset = IncompleteDataset(data, masks, labels)
+
+
+incomplete_dataset = utils.restore_incomplete_dataset(0.001, '_full')
 
 
 print(f"train : {len(incomplete_dataset)}, test : {len(test_set)}")
 # MMVAE
-model_config = MoPoEConfig(
+# MVAE
+# MoPoE
+# MVTCAE
+
+model_config = MVAEConfig(
     n_modalities=2,
     latent_dim=20,
     input_dims={"mnist": (1, 28, 28), "svhn": (3, 32, 32)},
@@ -187,7 +195,7 @@ model_config = MoPoEConfig(
 )
 
 
-model = MoPoE(
+model = MVAE(
     model_config,
     encoders={
         "mnist": EncoderMNIST(num_hidden_layers=1, config=model_config),
@@ -199,8 +207,8 @@ model = MoPoE(
     },
 )
 
-# Training
 
+# Training
 training_config = BaseTrainerConfig(
     learning_rate=1e-3,
     per_device_train_batch_size=128,
@@ -210,12 +218,12 @@ training_config = BaseTrainerConfig(
     optimizer_cls="Adam",
     optimizer_params={"amsgrad": True},
     steps_predict=1,
-    output_dir='./multivae_logs/multivae_full'
+    output_dir='./multivae_logs/multivae_01proc'
 )
 
 # Set up callbacks
 wandb_cb = WandbCallback()
-wandb_cb.setup(training_config, model_config, project_name="multivae_full")
+wandb_cb.setup(training_config, model_config, project_name="multivae_01proc")
 
 callbacks = [ProgressBarCallback(), wandb_cb]
 

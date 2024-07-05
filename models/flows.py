@@ -9,6 +9,7 @@ from models.utils import Conv2dZeros, SpaceToDepth, FactorOut, ToLogits, CondToL
 from models.utils import DummyCond, IdFunction
 import warnings
 
+DIMS = 20
 
 class Flow(nn.Module):
     def __init__(self, modules):
@@ -104,8 +105,6 @@ class FlowPDF(nn.Module):
     
     def conditional_sample(self, y, device):
         N = y.shape[0]
-        H = 196
-        M = 784
         mean1 = self.prior.deep_prior.mean
         sigma1 = torch.exp(self.prior.deep_prior.logsigma)
         z_h = torch.normal(mean1.repeat([N, 1]), sigma1.repeat([N, 1])).to(device)
@@ -134,7 +133,10 @@ class DeepConditionalFlowPDF(nn.Module):
             return log_det + self.deep_prior.log_prob(z)
         else:
             log_det, z = self.flow(x[:, -self.deep_dim:], y)
-            return log_det + self.deep_prior.log_prob(z) + self.shallow_prior.log_prob(x[:, :-self.deep_dim].squeeze())
+            x_sq = x[:, :-self.deep_dim].squeeze()
+            if len(x_sq.shape) == 1:
+                x_sq = x_sq.unsqueeze(0)
+            return log_det + self.deep_prior.log_prob(z) + self.shallow_prior.log_prob(x_sq)
 
     def log_prob_joint(self, x, y):
         return self.log_prob(x, y) + self.yprior.log_prob(y)
@@ -186,6 +188,19 @@ class ArbitraryConditionalPrior(object):
 
     def log_prob(self, value):
         return self.conditional.log_prob(value.argmax(axis=1))
+
+
+class VAEConditionalPrior(object):
+    def __init__(self, latent_size, device):
+        self.latent_size = latent_size
+        self.n_samples = 10
+        self.prior = torch.distributions.Normal(torch.zeros((1)).to(device), torch.ones((1)).to(device))
+
+    def enumerate_support(self):
+        return torch.normal(0, 1, (self.n_samples, self.latent_size))
+
+    def log_prob(self, value):
+        return self.prior.log_prob(value).sum(axis=2)
 
 
 class ArbitraryConditionalFlowPDF(DiscreteConditionalFlowPDF):
@@ -381,7 +396,7 @@ def get_flow(num_layers, k_factor, in_channels=1, hid_dim=[256], conv='full', hh
     return DiscreteConditionalFlow(modules, n_cat, emb_dim) if cond else Flow(modules)
 
 
-def get_flow_cond(num_layers, k_factor, in_channels=1, hid_dim=256, conv='full', hh_factors=2, num_cat=10, emb_dim=10):
+def get_flow_cond(num_layers, k_factor, in_channels=1, hid_dim=256, conv='full', hh_factors=2, num_cat=10, emb_dim=DIMS):
     modules = []
     channels = in_channels
     for l in range(num_layers):

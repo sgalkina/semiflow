@@ -8,6 +8,8 @@ from sklearn.cluster import MiniBatchKMeans
 import matplotlib.pyplot as plt
 import warnings
 from models import flows, coupling
+import pickle
+from multivae.data.datasets import IncompleteDataset
 
 
 def viz_array_grid(array, rows, cols, padding=0, channels_last=False, normalize=False, **kwargs):
@@ -215,3 +217,19 @@ class MovingMetric(object):
 
     def avg(self):
         return self.sum / self.n if self.n != 0 else np.nan
+
+
+def restore_incomplete_dataset(N, postfix, data_dir='./datasets_incomplete/'):
+    with open(data_dir + f'{N}_masks{postfix}.pickle', 'rb') as handle:
+        masks = pickle.load(handle)
+    with open(data_dir + f'{N}_labels{postfix}.pickle', 'rb') as handle:
+        labels = pickle.load(handle)
+    data = np.load(data_dir + f'{N}_data{postfix}.npz')
+
+    data_dict = dict(
+        mnist = data['mnist'],
+        svhn = data['svhn']
+    )
+
+    return IncompleteDataset(data_dict, masks, labels)
+
