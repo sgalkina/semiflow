@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import train_vae_svhn
 from torch.utils.data import DataLoader
 from multivae.data.datasets import MnistSvhn
+from multivae.data.utils import set_inputs_to_device
+import timm
 
 
 def get_metrics(model, loader):
@@ -166,6 +168,49 @@ DATA_PATH = './MNIST-SVHN'
 test_set = MnistSvhn(data_path = DATA_PATH, split="test", data_multiplication=1, download=True)
 test_dataloader = DataLoader(test_set, batch_size=256, shuffle=False)
 
+incomplete_dataset = utils.restore_incomplete_dataset(0.001, '')
+
+incomplete_dataloader = DataLoader(
+            dataset=incomplete_dataset,
+            batch_size=args.train_bs,
+            num_workers=8,
+            shuffle=True,
+        )
+
+class UniformNoise(object):
+    def __init__(self, bits=256):
+        self.bits = bits
+
+    def __call__(self, x):
+        with torch.no_grad():
+            noise = torch.rand_like(x)
+            # TODO: generalize. x assumed to be normalized to [0, 1]
+            return (x * (self.bits - 1) + noise) / self.bits
+
+    def __repr__(self):
+        return "UniformNoise"
+
+apply_noise = UniformNoise()
+
+for i, batch in enumerate(incomplete_dataloader):
+    x = apply_noise(batch['data']['mnist'])
+    x = x.to(device)
+    y = batch['data']['svhn']
+    y = y.to(device)
+    labels = batch['labels']
+    masks = batch['masks']['svhn']
+    n_sup = (masks).sum().item()
+
+    log_det, z = model.flow(x)
+
+    log_prior = torch.ones((x.size(0),)).to(x.device)
+    if n_sup != z.shape[0]:
+        log_prior[~masks] = model.prior.log_prob(z[~masks])
+    if n_sup != 0:
+        y_cond, _, _ = vae_model.encode(y[masks])
+        log_prior[masks] = model.prior.log_prob(z[masks], y=y_cond)
+
+
 
 correct, count = 0, 0
 for i, batch in enumerate(test_dataloader):
@@ -177,10 +222,13 @@ for i, batch in enumerate(test_dataloader):
     y_test = vae_model.encode(y)[0]
     x_mnist = model.conditional_sample(y_test, device=device)
 
-    correct += sum(clf(x_mnist).argmax(1) == y_sup).tolist()
-    count += len(y_sup.tolist())
+    correct += sum(clf(x_mnist).argmax(1) == labels).tolist()
+    count += len(labels.tolist())
     if i == 0:
+        print('Ground truth', labels.tolist()[:64])
         x_test = x_mnist[:64].detach().cpu().numpy()
         if not np.any(np.isnan(x_test)):
             plt.imshow(utils.viz_array_grid(x_test, 8, 8))
             plt.savefig(f"eval_{model.__class__.__name__}.pdf")
+
+print('Total test accuracy:', correct / count)

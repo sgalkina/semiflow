@@ -11,7 +11,7 @@ k: 4
 l: 2
 log_each: 1
 logits: true
-lr: 0.0001
+lr: 0.001
 lr_gamma: 0.5
 lr_schedule: linear
 lr_steps: []

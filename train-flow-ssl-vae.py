@@ -99,7 +99,7 @@ shallow_prior = distributions.GaussianDiag(dim - args.ssl_dim)
 
 LATENT = 20
 
-checkpoint = torch.load("./logs/VAE_SVHN_checkpoint.pth")
+checkpoint = torch.load("./logs/VAE_SVHN_checkpoint_2.pth")
 
 vae_model = train_vae_svhn.VAE(LATENT).to(device)
 vae_model.load_state_dict(checkpoint['model'])
