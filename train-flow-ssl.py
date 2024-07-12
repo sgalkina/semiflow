@@ -11,6 +11,7 @@ import warnings
 import torch.nn.functional as F
 import argparse
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
 
 def get_metrics(model, loader):
@@ -133,6 +134,39 @@ if args.pretrained != '':
     # model.load_state_dict(torch.load(os.path.join(args.pretrained, 'model.torch')))
     # optimizer.load_state_dict(torch.load(os.path.join(args.pretrained, 'optimizer.torch')))
 
+
+incomplete_dataset = utils.restore_incomplete_dataset(0.001, '')
+
+
+masks = np.array(incomplete_dataset.masks['svhn'])
+incomplete_dataset.data['mnist'] = incomplete_dataset.data['mnist'][masks]
+incomplete_dataset.data['svhn'] = incomplete_dataset.data['svhn'][masks]
+incomplete_dataset.labels = np.array(incomplete_dataset.labels)[masks]
+incomplete_dataset.masks['mnist'] = np.array(incomplete_dataset.masks['svhn'])[masks]
+incomplete_dataset.masks['svhn'] = np.array(incomplete_dataset.masks['svhn'])[masks]
+
+incomplete_dataloader = DataLoader(
+            dataset=incomplete_dataset,
+            batch_size=args.train_bs,
+            num_workers=8,
+            shuffle=True,
+        )
+
+class UniformNoise(object):
+    def __init__(self, bits=256):
+        self.bits = bits
+
+    def __call__(self, x):
+        with torch.no_grad():
+            noise = torch.rand_like(x)
+            # TODO: generalize. x assumed to be normalized to [0, 1]
+            return (x * (self.bits - 1) + noise) / self.bits
+
+    def __repr__(self):
+        return "UniformNoise"
+
+apply_noise = UniformNoise()
+
 t0 = time.time()
 for epoch in range(1, args.epochs + 1):
     train_loss = 0.
@@ -140,35 +174,40 @@ for epoch in range(1, args.epochs + 1):
     train_elbo = utils.MovingMetric()
     train_cl = utils.MovingMetric()
 
-    for x, y in trainloader:
+    for i, batch in enumerate(incomplete_dataloader):
+        x = apply_noise(batch['data']['mnist'])
         x = x.to(device)
-        n_sup = (y != -1).sum().item()
+        y = batch['labels']
+        y = y.to(device)
+        masks = batch['masks']['svhn']
+        n_sup = (masks).sum().item()
+        print(n_sup)
 
         log_det, z = model.flow(x)
 
         log_prior = torch.ones((x.size(0),)).to(x.device)
         if n_sup != z.shape[0]:
-            log_prior[y == -1] = model.prior.log_prob(z[y == -1])
+            log_prior[~masks] = model.prior.log_prob(z[~masks])
         if n_sup != 0:
-            y_sup_onehot = torch.nn.functional.one_hot(y[y != -1].to(x.device), num_classes=len(c))
+            y_sup_onehot = torch.nn.functional.one_hot(y[masks].to(x.device), num_classes=len(c))
             y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
-            log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y_sup)
+            log_prior[masks] = model.prior.log_prob(z[masks], y=y_sup)
             # log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y[y != -1].to(x.device))
         elbo = log_det + log_prior
 
         weights = torch.ones((elbo.size(0),)).to(elbo)
-        weights[y != -1] = args.sup_weight
+        weights[masks] = args.sup_weight
         weights /= weights.sum()
 
         gen_loss = -(elbo * weights.detach()).sum()
 
         cl_loss = 0
         if n_sup != 0:
-            logp_full = model.prior.log_prob_full(z[y != -1])
+            logp_full = model.prior.log_prob_full(z[masks])
             prediction = logp_full
-            train_acc.add(utils.tonp(prediction.argmax(1).to(y) == y[y != -1]))
+            train_acc.add(utils.tonp(prediction.argmax(1).to(y) == y[masks]))
             if args.cl_weight != 0:
-                cl_loss = F.cross_entropy(prediction, y[y != -1].to(prediction.device), reduction='none')
+                cl_loss = F.cross_entropy(prediction, y[masks].to(prediction.device), reduction='none')
                 train_cl.add(utils.tonp(cl_loss))
                 cl_loss = cl_loss.mean()
 
@@ -181,15 +220,8 @@ for epoch in range(1, args.epochs + 1):
         train_elbo.add(utils.tonp(elbo))
         train_loss += loss.item() * x.size(0)
 
-    train_loss /= len(trainloader.dataset)
+    train_loss /= len(incomplete_dataloader.dataset)
     lr_scheduler.step()
-
-    y_test = y_sup[:4]
-    numbers = '_'.join(list(map(str, y_test.argmax(1).tolist())))
-    x_test = model.conditional_sample(y_test, device=device).detach().cpu().numpy()
-    if not np.any(np.isnan(x_test)):
-        plt.imshow(utils.viz_array_grid(x_test, 2, 2))
-        plt.savefig(f"{numbers}.pdf")
 
     if epoch % args.log_each == 0 or epoch == 1:
         with torch.no_grad():

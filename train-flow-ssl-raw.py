@@ -106,10 +106,21 @@ vae_model.load_state_dict(checkpoint['model'])
 
 vae_model.eval()
 
+incomplete_dataset = utils.restore_incomplete_dataset(0.001, '')
+
+incomplete_dataloader = DataLoader(
+            dataset=incomplete_dataset,
+            batch_size=args.train_bs,
+            num_workers=8,
+            shuffle=True,
+        )
+
 _, c = np.unique(trainloader.dataset.targets[trainloader.dataset.targets != -1], return_counts=True)
 # yprior = torch.distributions.Categorical(probs=torch.FloatTensor(c/c.sum()).to(device))
 # yprior = flows.ArbitraryConditionalPrior(counts=torch.FloatTensor(c/c.sum()), device=device)
-yprior = flows.VAEConditionalPrior(LATENT, device=device)
+# yprior = flows.VAEConditionalPrior(LATENT, device=device)
+rand_idx = np.random.choice(len(incomplete_dataset.data['svhn']), 10)
+yprior = flows.RandomConditionalPrior(torch.FloatTensor(incomplete_dataset.data['svhn'][rand_idx]), device=device)
 ssl_flow = utils.create_cond_flow(args)
 # ssl_flow = torch.nn.DataParallel(ssl_flow.to(device))
 ssl_flow.to(device)
@@ -117,7 +128,9 @@ ssl_flow.to(device)
 
 # prior = flows.DiscreteConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
 #                                          shallow_prior=shallow_prior)
-prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+# prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+#                                          shallow_prior=shallow_prior)
+prior = flows.RawConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
                                          shallow_prior=shallow_prior)
 
 flow = utils.create_flow(args, data_shape)
@@ -145,15 +158,6 @@ if args.pretrained != '':
     model.load_state_dict(torch.load(args.pretrained))
     # model.load_state_dict(torch.load(os.path.join(args.pretrained, 'model.torch')))
     # optimizer.load_state_dict(torch.load(os.path.join(args.pretrained, 'optimizer.torch')))
-
-incomplete_dataset = utils.restore_incomplete_dataset(1, '_full')
-
-incomplete_dataloader = DataLoader(
-            dataset=incomplete_dataset,
-            batch_size=args.train_bs,
-            num_workers=8,
-            shuffle=True,
-        )
 
 class UniformNoise(object):
     def __init__(self, bits=256):
@@ -192,8 +196,7 @@ for epoch in range(1, args.epochs + 1):
         if n_sup != z.shape[0]:
             log_prior[~masks] = model.prior.log_prob(z[~masks])
         if n_sup != 0:
-            _, y_cond, _ = vae_model.encode(y[masks])
-            log_prior[masks] = model.prior.log_prob(z[masks], y=y_cond)
+            log_prior[masks] = model.prior.log_prob(z[masks], y=y[masks])
         elbo = log_det + log_prior
 
         weights = torch.ones((elbo.size(0),)).to(elbo)
@@ -213,15 +216,6 @@ for epoch in range(1, args.epochs + 1):
 
     train_loss /= len(trainloader.dataset)
     lr_scheduler.step()
-
-    y_test = vae_model.encode(y)[1]
-    print(y_test.shape)
-    y_test = y_test[:4]
-    x_test = model.conditional_sample(y_test, device=device).detach().cpu().numpy()
-    print(x_test.shape)
-    if not np.any(np.isnan(x_test)):
-        plt.imshow(utils.viz_array_grid(x_test, 2, 2))
-        plt.savefig(f"vae_flow_training_{epoch}.pdf")
 
     if epoch % args.log_each == 0 or epoch == 1:
         with torch.no_grad():

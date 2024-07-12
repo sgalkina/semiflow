@@ -12,6 +12,9 @@ import torch.nn.functional as F
 import argparse
 import matplotlib.pyplot as plt
 import timm
+from multivae.data.datasets import MnistSvhn
+from torch.utils.data import DataLoader
+from multivae.data.utils import set_inputs_to_device
 
 
 def get_metrics(model, loader):
@@ -146,39 +149,72 @@ clf.load_state_dict(
 )
 clf = clf.to(device)
 
-for x, y in trainloader:
-    x = x.to(device)
-    n_sup = (y != -1).sum().item()
+# Dataset
+DATA_PATH = './MNIST-SVHN'
+test_set = MnistSvhn(data_path = DATA_PATH, split="test", data_multiplication=1, download=True)
+test_dataloader = DataLoader(test_set, batch_size=64, shuffle=False)
 
-    # hack, because f(...) needed before the g(...)
-    model.eval()
+print(f"test : {len(test_set)}")
+
+
+incomplete_dataset = utils.restore_incomplete_dataset(0.001, '')
+
+incomplete_dataloader = DataLoader(
+            dataset=incomplete_dataset,
+            batch_size=2,
+            num_workers=8,
+            shuffle=True,
+        )
+
+class UniformNoise(object):
+    def __init__(self, bits=256):
+        self.bits = bits
+
+    def __call__(self, x):
+        with torch.no_grad():
+            noise = torch.rand_like(x)
+            # TODO: generalize. x assumed to be normalized to [0, 1]
+            return (x * (self.bits - 1) + noise) / self.bits
+
+    def __repr__(self):
+        return "UniformNoise"
+
+apply_noise = UniformNoise()
+
+for i, batch in enumerate(incomplete_dataloader):
+    x = apply_noise(batch['data']['mnist'])
+    x = x.to(device)
+    y = batch['labels']
+    y = y.to(device)
+    masks = batch['masks']['svhn']
+    n_sup = (masks).sum().item()
+
     log_det, z = model.flow(x)
+
     log_prior = torch.ones((x.size(0),)).to(x.device)
     if n_sup != z.shape[0]:
-        log_prior[y == -1] = model.prior.log_prob(z[y == -1])
+        log_prior[~masks] = model.prior.log_prob(z[~masks])
     if n_sup != 0:
-        y_sup_onehot = torch.nn.functional.one_hot(y[y != -1].to(x.device), num_classes=len(c))
+        y_sup_onehot = torch.nn.functional.one_hot(y[masks].to(x.device), num_classes=len(c))
         y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
-        log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y_sup)
-    # end of hack, because f(...) needed before the g(...)
-
-    y_test = y_sup[:64]
-    numbers = '_'.join(list(map(str, y_test.argmax(1).tolist())))
-    x_res = model.conditional_sample(y_test, device=device)
-    x_test = x_res.detach().cpu().numpy()
-    if not np.any(np.isnan(x_test)):
-        plt.imshow(utils.viz_array_grid(x_test, 8, 8))
-        plt.savefig(f"train_eval.pdf")
-    print('Train accuracy for 64 samples:', sum(clf(x_res).argmax(1) == y_test.argmax(1)).tolist() / 64)
+        log_prior[masks] = model.prior.log_prob(z[masks], y=y_sup)
     break
+    
 
 correct, count = 0, 0
-for x, y in testloader:
-    x = x.to(device)
-    y_sup_onehot = torch.nn.functional.one_hot(y[y != -1].to(x.device), num_classes=len(c))
+for i, batch in enumerate(test_dataloader):
+    batch = set_inputs_to_device(batch, device='cuda')
+    y = batch['labels']
+    y_sup_onehot = torch.nn.functional.one_hot(y.to(device), num_classes=len(c))
     y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
     x_res = model.conditional_sample(y_sup, device=device)
     correct += sum(clf(x_res).argmax(1) == y_sup.argmax(1)).tolist()
     count += len(y_sup.argmax(1).tolist())
+
+    if i == 0:
+        x_test = x_res[:64].detach().cpu().numpy()
+        if not np.any(np.isnan(x_test)):
+            plt.imshow(utils.viz_array_grid(x_test, 8, 8))
+            plt.savefig(f"eval_{model.__class__.__name__}.pdf")
 
 print('Total test accuracy:', correct / count)

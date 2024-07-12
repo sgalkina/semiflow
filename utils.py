@@ -198,6 +198,9 @@ def create_cond_flow(args):
     if args.ssl_model == 'cond-flow':
         flow = flows.get_flow_cond(args.ssl_l, args.ssl_k, in_channels=args.ssl_dim, hid_dim=args.ssl_hd,
                                    conv=args.ssl_conv, hh_factors=args.ssl_hh, num_cat=args.ssl_nclasses)
+    elif args.ssl_model == 'cond-flow-raw':
+        flow = flows.get_flow_raw_cond(args.ssl_l, args.ssl_k, in_channels=args.ssl_dim, hid_dim=args.ssl_hd,
+                                   conv=args.ssl_conv, hh_factors=args.ssl_hh, num_cat=args.ssl_nclasses)
     elif args.ssl_model == 'cond-shift':
         flow = flows.ConditionalFlow([
             coupling.ConditionalShift(args.ssl_dim, args.ssl_nclasses)

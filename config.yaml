@@ -28,7 +28,7 @@ ssl_hd: 256
 ssl_hh: 2
 ssl_k: 4
 ssl_l: 2
-ssl_model: cond-flow
+ssl_model: cond-flow-raw
 ssl_nclasses: 10
 status: done
 sup_ohe: true

@@ -18,15 +18,15 @@ L = len(train_set)
 
 # Define random data samples
 data = dict(
-    mnist = torch.stack([b['data']['mnist'] for b in train_set] + [b['data']['mnist'] for b in train_set]),
-    svhn = torch.stack([b['data']['svhn'] for b in train_set] + [b['data']['svhn'] for b in train_set])
+    mnist = torch.stack([b['data']['mnist'] for b in train_set]),
+    svhn = torch.stack([b['data']['svhn'] for b in train_set])
 )
 # Define random masks : masks are boolean tensors: True indicates the modality is available. 
 
 # Arbitrary labels (optional)
 labels = torch.stack([b['labels'] for b in train_set]).tolist()
 
-N = 0.1
+N = 1
 
 def make_balanced_mask(labels):
     classes = list(set(labels))
@@ -44,11 +44,10 @@ def make_balanced_mask(labels):
     return mask
 
 masks = dict(
-    mnist = [1]*len(labels) + [0]*len(labels),
-    svhn = make_balanced_mask(labels) + [1]*len(labels),
+    mnist = [1]*len(labels),
+    svhn = make_balanced_mask(labels),
 )
 
-labels = torch.stack([b['labels'] for b in train_set] + [b['labels'] for b in train_set]).tolist()
 
 DIR = './datasets_incomplete/'
 

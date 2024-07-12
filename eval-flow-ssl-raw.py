@@ -13,6 +13,9 @@ import argparse
 import matplotlib.pyplot as plt
 import train_vae_svhn
 from torch.utils.data import DataLoader
+from multivae.data.datasets import MnistSvhn
+from multivae.data.utils import set_inputs_to_device
+import timm
 
 
 def get_metrics(model, loader):
@@ -53,7 +56,7 @@ parser.add_argument('--k', default=4, type=int)
 parser.add_argument('--l', default=2, type=int)
 parser.add_argument('--hid_dim', type=int, nargs='*', default=[])
 # Prior
-parser.add_argument('--ssl_model', default='cond-flow')
+parser.add_argument('--ssl_model', default='cond-flow-raw')
 parser.add_argument('--ssl_dim', default=-1, type=int)
 parser.add_argument('--ssl_l', default=2, type=int)
 parser.add_argument('--ssl_k', default=3, type=int)
@@ -99,17 +102,23 @@ shallow_prior = distributions.GaussianDiag(dim - args.ssl_dim)
 
 LATENT = 20
 
-checkpoint = torch.load("./logs/VAE_SVHN_checkpoint_2.pth")
 
-vae_model = train_vae_svhn.VAE(LATENT).to(device)
-vae_model.load_state_dict(checkpoint['model'])
 
-vae_model.eval()
+incomplete_dataset = utils.restore_incomplete_dataset(0.001, '')
+
+incomplete_dataloader = DataLoader(
+            dataset=incomplete_dataset,
+            batch_size=args.train_bs,
+            num_workers=8,
+            shuffle=True,
+        )
 
 _, c = np.unique(trainloader.dataset.targets[trainloader.dataset.targets != -1], return_counts=True)
 # yprior = torch.distributions.Categorical(probs=torch.FloatTensor(c/c.sum()).to(device))
 # yprior = flows.ArbitraryConditionalPrior(counts=torch.FloatTensor(c/c.sum()), device=device)
-yprior = flows.VAEConditionalPrior(LATENT, device=device)
+# yprior = flows.VAEConditionalPrior(LATENT, device=device)
+rand_idx = np.random.choice(len(incomplete_dataset.data['svhn']), 10)
+yprior = flows.RandomConditionalPrior(torch.FloatTensor(incomplete_dataset.data['svhn'][rand_idx]), device=device)
 ssl_flow = utils.create_cond_flow(args)
 # ssl_flow = torch.nn.DataParallel(ssl_flow.to(device))
 ssl_flow.to(device)
@@ -117,7 +126,9 @@ ssl_flow.to(device)
 
 # prior = flows.DiscreteConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
 #                                          shallow_prior=shallow_prior)
-prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+# prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+#                                          shallow_prior=shallow_prior)
+prior = flows.RawConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
                                          shallow_prior=shallow_prior)
 
 flow = utils.create_flow(args, data_shape)
@@ -146,14 +157,25 @@ if args.pretrained != '':
     # model.load_state_dict(torch.load(os.path.join(args.pretrained, 'model.torch')))
     # optimizer.load_state_dict(torch.load(os.path.join(args.pretrained, 'optimizer.torch')))
 
-incomplete_dataset = utils.restore_incomplete_dataset(1, '_full')
 
-incomplete_dataloader = DataLoader(
-            dataset=incomplete_dataset,
-            batch_size=args.train_bs,
-            num_workers=8,
-            shuffle=True,
-        )
+# Pretrained MNIST classifier
+clf = timm.create_model("resnet18", pretrained=False, num_classes=10)
+clf.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+clf.load_state_dict(
+  torch.hub.load_state_dict_from_url(
+    "https://huggingface.co/gpcarl123/resnet18_mnist/resolve/main/resnet18_mnist.pth",
+    map_location=device,
+    file_name="resnet18_mnist.pth",
+  )
+)
+clf = clf.to(device)
+
+
+# Dataset
+DATA_PATH = './MNIST-SVHN'
+test_set = MnistSvhn(data_path = DATA_PATH, split="test", data_multiplication=1, download=True)
+test_dataloader = DataLoader(test_set, batch_size=256, shuffle=False)
+
 
 class UniformNoise(object):
     def __init__(self, bits=256):
@@ -170,73 +192,41 @@ class UniformNoise(object):
 
 apply_noise = UniformNoise()
 
-t0 = time.time()
-for epoch in range(1, args.epochs + 1):
-    train_loss = 0.
-    train_acc = utils.MovingMetric()
-    train_elbo = utils.MovingMetric()
-    train_cl = utils.MovingMetric()
+for i, batch in enumerate(incomplete_dataloader):
+    x = apply_noise(batch['data']['mnist'])
+    x = x.to(device)
+    y = batch['data']['svhn']
+    y = y.to(device)
+    labels = batch['labels']
+    masks = batch['masks']['svhn']
+    n_sup = (masks).sum().item()
 
-    for i, batch in enumerate(incomplete_dataloader):
-        x = apply_noise(batch['data']['mnist'])
-        x = x.to(device)
-        y = batch['data']['svhn']
-        y = y.to(device)
-        labels = batch['labels']
-        masks = batch['masks']['svhn']
-        n_sup = (masks).sum().item()
+    log_det, z = model.flow(x)
 
-        log_det, z = model.flow(x)
+    log_prior = torch.ones((x.size(0),)).to(x.device)
+    if n_sup != z.shape[0]:
+        log_prior[~masks] = model.prior.log_prob(z[~masks])
+    if n_sup != 0:
+        log_prior[masks] = model.prior.log_prob(z[masks], y=y[masks])
 
-        log_prior = torch.ones((x.size(0),)).to(x.device)
-        if n_sup != z.shape[0]:
-            log_prior[~masks] = model.prior.log_prob(z[~masks])
-        if n_sup != 0:
-            _, y_cond, _ = vae_model.encode(y[masks])
-            log_prior[masks] = model.prior.log_prob(z[masks], y=y_cond)
-        elbo = log_det + log_prior
 
-        weights = torch.ones((elbo.size(0),)).to(elbo)
-        weights[masks] = args.sup_weight
-        weights /= weights.sum()
 
-        gen_loss = -(elbo * weights.detach()).sum()
+correct, count = 0, 0
+for i, batch in enumerate(test_dataloader):
+    batch = set_inputs_to_device(batch, device='cuda')
 
-        loss = gen_loss
+    y = batch['data']['svhn']
+    labels = batch['labels']
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    x_mnist = model.conditional_sample(y, device=device)
 
-        train_elbo.add(utils.tonp(elbo))
-        train_loss += loss.item() * x.size(0)
+    correct += sum(clf(x_mnist).argmax(1) == labels).tolist()
+    count += len(labels.tolist())
+    if i == 0:
+        print('Ground truth', labels.tolist()[:64])
+        x_test = x_mnist[:64].detach().cpu().numpy()
+        if not np.any(np.isnan(x_test)):
+            plt.imshow(utils.viz_array_grid(x_test, 8, 8))
+            plt.savefig(f"eval_{model.__class__.__name__}.pdf")
 
-    train_loss /= len(trainloader.dataset)
-    lr_scheduler.step()
-
-    y_test = vae_model.encode(y)[1]
-    print(y_test.shape)
-    y_test = y_test[:4]
-    x_test = model.conditional_sample(y_test, device=device).detach().cpu().numpy()
-    print(x_test.shape)
-    if not np.any(np.isnan(x_test)):
-        plt.imshow(utils.viz_array_grid(x_test, 2, 2))
-        plt.savefig(f"vae_flow_training_{epoch}.pdf")
-
-    if epoch % args.log_each == 0 or epoch == 1:
-        with torch.no_grad():
-            test_logp, test_acc = get_metrics(model, testloader)
-        logger.add_scalar(epoch, 'train.loss', train_loss)
-        logger.add_scalar(epoch, 'train.elbo', train_elbo.avg())
-        logger.add_scalar(epoch, 'train.cl', train_cl.avg())
-        logger.add_scalar(epoch, 'train.acc', train_acc.avg())
-        logger.add_scalar(epoch, 'test.logp', test_logp)
-        logger.add_scalar(epoch, 'test.acc', test_acc)
-        logger.add_scalar(epoch, 'test.bits/dim', utils.bits_dim(test_logp, dim, bits))
-        logger.add_scalar(epoch, 'time', time.time() - t0)
-        t0 = time.time()
-        logger.iter_info()
-        logger.save()
-
-        torch.save(model.state_dict(), os.path.join(args.root, 'model.torch'))
-        torch.save(optimizer.state_dict(), os.path.join(args.root, 'optimizer.torch'))
+print('Total test accuracy:', correct / count)

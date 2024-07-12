@@ -17,6 +17,14 @@ import matplotlib.pyplot as plt
 
 import utils
 
+import numpy as np
+from sklearn.mixture import GaussianMixture
+
+gm = GaussianMixture(n_components=2, random_state=0).fit(X)
+gm.means_
+gm.predict([[0, 0], [12, 3]])
+
+
 # Classes
 class EncoderSVHN(BaseEncoder):
     def __init__(self, latent_dim):
@@ -67,7 +75,7 @@ class DecoderSVHN(BaseDecoder):
             nn.ReLU(True),
             # size: (fBase) x 16 x 16
             nn.ConvTranspose2d(fBase, imgChans, 4, 2, 1, bias=True),
-            # nn.Sigmoid()
+            nn.Sigmoid()
             # Output size: 3 x 32 x 32
         )
 
@@ -133,9 +141,9 @@ test_dataloader = DataLoader(test_set, batch_size=B, shuffle=False)
 
 
 def compute_loss(inputs, outputs, mu, logvar):
-    reconstruction_loss = nn.BCEWithLogitsLoss(reduction='sum')(outputs, inputs)
+    reconstruction_loss = nn.MSELoss(reduction='sum')(inputs, outputs)
     kl_loss = -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp())
-    return 0.01*kl_loss + reconstruction_loss
+    return 0*kl_loss + reconstruction_loss
 
 
 def train_vae():
@@ -149,51 +157,50 @@ def train_vae():
         else torch.device('cpu')
     print('before VAE')
 
-    checkpoint = torch.load("./logs/VAE_SVHN_checkpoint_bce.pth")
+    # checkpoint = torch.load("./logs/VAE_SVHN_checkpoint.pth")
 
     model = VAE(latent_dimension).to(device)
-    model.load_state_dict(checkpoint['model'])
+    # model.load_state_dict(checkpoint['model'])
     
-    optim = Adam(model.parameters(), lr=1e-3)
-    optim.load_state_dict(checkpoint['optim'])
+    optim = Adam(model.parameters(), lr=1e-4)
+    # optim.load_state_dict(checkpoint['optim'])
 
     val_greater_count = 0
     print('starting the training')
 
-    # for e in range(epochs):
-    #     running_loss = 0
-    #     model.train()
-    #     for batch in train_dataloader:
-    #         images = batch['data']['svhn']
-    #         images = images.to(device)
-    #         model.zero_grad()
-    #         outputs, mu, logvar = model(images)
-    #         loss = compute_loss(images, outputs, mu, logvar)
-    #         running_loss += loss
-    #         loss.backward()
-    #         optim.step()
+    for e in range(epochs):
+        running_loss = 0
+        model.train()
+        for batch in train_dataloader:
+            images = batch['data']['svhn']
+            images = images.to(device)
+            model.zero_grad()
+            outputs, mu, logvar = model(images)
+            loss = compute_loss(images, outputs, mu, logvar)
+            running_loss += loss
+            loss.backward()
+            optim.step()
 
-    #     running_loss = running_loss/len(train_dataloader)
-    #     model.eval()
+        running_loss = running_loss/len(train_dataloader)
+        model.eval()
 
-    #     # save model
-    #     torch.save({
-    #         'epoch': e,
-    #         'model': model.state_dict(),
-    #         'running_loss': running_loss,
-    #         'optim': optim.state_dict(),
-    #     }, "./logs/VAE_SVHN_checkpoint_bce.pth")
-    #     print("Epoch: {} Train Loss: {}".format(e+1, running_loss.item()))
+        # save model
+        torch.save({
+            'epoch': e,
+            'model': model.state_dict(),
+            'running_loss': running_loss,
+            'optim': optim.state_dict(),
+        }, "./logs/VAE_SVHN_checkpoint_bce.pth")
+        print("Epoch: {} Train Loss: {}".format(e+1, running_loss.item()))
 
-    #     # check early stopping condition
-    #     if val_greater_count >= patience:
-    #         break
+        # check early stopping condition
+        if val_greater_count >= patience:
+            break
 
     z = torch.normal(0, 1, (64, latent_dimension)).to(device)
-    images = torch.sigmoid(model.decoder(z)).cpu().detach().numpy()
+    images = model.decoder(z).cpu().detach().numpy()
     plt.imshow(utils.viz_array_grid(images, 8, 8))
     plt.savefig(f"VAE_SVHN_bce.pdf")
-
 
 if __name__ == "__main__":
     train_vae()

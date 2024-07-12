@@ -8,8 +8,10 @@ from models.coupling import CouplingLayer, MaskedCouplingLayer, ConditionalCoupl
 from models.utils import Conv2dZeros, SpaceToDepth, FactorOut, ToLogits, CondToLogits, CondFactorOut, CondSpaceToDepth
 from models.utils import DummyCond, IdFunction
 import warnings
+from pythae.models.base.base_model import BaseEncoder
 
-DIMS = 20
+DIMS_RAW = 100
+DIMS = 10
 
 class Flow(nn.Module):
     def __init__(self, modules):
@@ -65,10 +67,21 @@ class ConditionalFlow(Flow):
         return self.f(x, y)
 
 
+class DiscreteConditionalFlowRaw(ConditionalFlow):
+    def __init__(self, modules, num_cat, emb_dim):
+        super().__init__(modules)
+        self.embeddings = EncoderSVHN(DIMS_RAW)
+
+    def f(self, x, y):
+        return super().f(x, self.embeddings(y))
+
+    def g(self, z, y):
+        return super().g(z, self.embeddings(y))
+
+
 class DiscreteConditionalFlowNoEmb(ConditionalFlow):
     def __init__(self, modules, num_cat, emb_dim):
         super().__init__(modules)
-        # self.embeddings = nn.Linear(num_cat, emb_dim)
 
     def f(self, x, y):
         return super().f(x, y)
@@ -201,6 +214,41 @@ class VAEConditionalPrior(object):
 
     def log_prob(self, value):
         return self.prior.log_prob(value).sum(axis=2)
+
+
+class RandomConditionalPrior(object):
+    def __init__(self, samples, device):
+        self.samples = samples
+        self.n_samples = samples.shape[0]
+        self.device = device
+        self.conditional = torch.distributions.Categorical(probs=torch.FloatTensor([1/10]*10).to(self.device))
+
+    def enumerate_support(self):
+        return self.samples
+
+    def log_prob(self, value):
+        return self.conditional.log_prob(torch.Tensor([1]*value.shape[0]).to(self.device))
+
+
+class RawConditionalFlowPDF(DiscreteConditionalFlowPDF):
+    def __init__(self, flow, deep_prior, yprior, deep_dim, shallow_prior=None):
+        super().__init__(flow, deep_prior, yprior, deep_dim, shallow_prior=shallow_prior)
+        self.flow = flow
+        self.shallow_prior = shallow_prior
+        self.deep_prior = deep_prior
+        self.yprior = yprior
+        self.deep_dim = deep_dim
+
+    def log_prob_full(self, x):
+        sup = self.yprior.enumerate_support().to(x.device)
+
+        n_uniq, a, b, c = sup.shape
+        N = x.size(0)
+        y = sup.unsqueeze(1).repeat((1, N, 1, 1, 1)).reshape((N*n_uniq, a, b, c))
+        
+        y = y.clone().detach().float().requires_grad_(True)
+        logp = self.log_prob(x.repeat([n_uniq] + [1]*(len(x.shape)-1)), y)
+        return logp.reshape((n_uniq, x.size(0))).t() + self.yprior.log_prob(sup[None])
 
 
 class ArbitraryConditionalFlowPDF(DiscreteConditionalFlowPDF):
@@ -338,6 +386,39 @@ def netfunc_for_coupling(in_channels, hidden_channels, out_channels, k=3):
     return foo
 
 
+class EncoderSVHN(BaseEncoder):
+    def __init__(self, latent_dim):
+        super().__init__()
+        dataSize = torch.Size([3, 32, 32])
+        imgChans = dataSize[0]
+        fBase = 32  # base size of filter channels
+        self.latent_dim = latent_dim
+
+        self.enc = nn.Sequential(
+            # input size: 3 x 32 x 32
+            nn.Conv2d(imgChans, fBase, 4, 2, 1, bias=True),
+            nn.ReLU(True),
+            # size: (fBase) x 16 x 16
+            nn.Conv2d(fBase, fBase * 2, 4, 2, 1, bias=True),
+            nn.ReLU(True),
+            # size: (fBase * 2) x 8 x 8
+            nn.Conv2d(fBase * 2, fBase * 4, 4, 2, 1, bias=True),
+            nn.ReLU(True),
+            # size: (fBase * 4) x 4 x 4
+        )
+        self.c1 = nn.Conv2d(fBase * 4, self.latent_dim, 4, 1, 0, bias=True)
+        # c1, c2 size: latent_dim x 1 x 1
+
+    def forward(self, x):
+        e = self.enc(x)
+        emb = self.c1(e)
+        a = emb.shape[0]
+        emb = emb.squeeze()
+        if a == 1:
+            return emb.unsqueeze(0)
+        return emb
+
+
 def get_flow(num_layers, k_factor, in_channels=1, hid_dim=[256], conv='full', hh_factors=2,
              cond=False, emb_dim=10, n_cat=10, net='shallow'):
     modules = [
@@ -423,6 +504,34 @@ def get_flow_cond(num_layers, k_factor, in_channels=1, hid_dim=256, conv='full',
 
     # return DiscreteConditionalFlow(modules, num_cat, emb_dim)
     return DiscreteConditionalFlowNoEmb(modules, num_cat, emb_dim)
+
+
+def get_flow_raw_cond(num_layers, k_factor, in_channels=1, hid_dim=256, conv='full', hh_factors=2, num_cat=10, emb_dim=DIMS_RAW):
+    modules = []
+    channels = in_channels
+    for l in range(num_layers):
+        for k in range(k_factor):
+            modules.append(DummyCondActNorm(channels))
+            if conv == 'full':
+                modules.append(DummyCondInvertibleConv2d(channels))
+            elif conv == 'hh':
+                modules.append(DummyCond(HHConv2d_1x1(channels, factors=[channels]*hh_factors)))
+            elif conv == 'qr':
+                modules.append(DummyCond(QRInvertibleConv2d(channels, factors=[channels]*hh_factors)))
+            elif conv == 'qr-abs':
+                modules.append(DummyCond(QRInvertibleConv2d(channels, factors=[channels]*hh_factors, act='no')))
+            else:
+                raise NotImplementedError
+
+            netf = lambda: get_resnet1x1(channels//2 + emb_dim, hid_dim, channels)
+            modules.append(ConditionalCouplingLayer(netf))
+
+        if l != num_layers - 1:
+            modules.append(CondFactorOut())
+            channels //= 2
+            channels -= channels % 2
+
+    return DiscreteConditionalFlowRaw(modules, num_cat, emb_dim)
 
 
 def mnist_flow(num_layers=5, k_factor=4, logits=True, conv='full', hh_factors=2, hid_dim=[32, 784]):
