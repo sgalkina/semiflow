@@ -136,3 +136,6 @@ logs/
 wandb/
 multivae_logs/
 datasets_incomplete/
+artifacts/
+.DS_Store
+._.DS_Store

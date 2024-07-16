@@ -5,4 +5,4 @@ module load anaconda3/2023.03-py3.10
 source ~/.bashrc
 conda activate semiflow
 
-/home/nmb127/.conda/envs/semiflow/bin/python train-flow-ssl-raw.py --config config.yaml
+/home/nmb127/.conda/envs/semiflow/bin/python train-flow-ssl-raw-gmm.py --config config-raw.yaml

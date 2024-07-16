@@ -12,6 +12,8 @@ import torch.nn.functional as F
 import argparse
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
+from sklearn.decomposition import PCA
+
 
 
 def get_metrics(model, loader):
@@ -95,6 +97,7 @@ if args.ssl_dim == -1:
     args.ssl_dim = dim
 deep_prior = distributions.GaussianDiag(args.ssl_dim)
 shallow_prior = distributions.GaussianDiag(dim - args.ssl_dim)
+zfprior = distributions.GmmPrior(10, args.ssl_dim)
 
 _, c = np.unique(trainloader.dataset.targets[trainloader.dataset.targets != -1], return_counts=True)
 # yprior = torch.distributions.Categorical(probs=torch.FloatTensor(c/c.sum()).to(device))
@@ -105,7 +108,9 @@ ssl_flow.to(device)
 
 # prior = flows.DiscreteConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
 #                                          shallow_prior=shallow_prior)
-prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+# prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+#                                          shallow_prior=shallow_prior)
+prior = flows.MoGArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, zfprior, deep_dim=args.ssl_dim,
                                          shallow_prior=shallow_prior)
 
 flow = utils.create_flow(args, data_shape)
@@ -135,7 +140,7 @@ if args.pretrained != '':
     # optimizer.load_state_dict(torch.load(os.path.join(args.pretrained, 'optimizer.torch')))
 
 
-incomplete_dataset = utils.restore_incomplete_dataset(0.001, '')
+incomplete_dataset = utils.restore_incomplete_dataset(1, '_full')
 
 
 masks = np.array(incomplete_dataset.masks['svhn'])
@@ -167,6 +172,24 @@ class UniformNoise(object):
 
 apply_noise = UniformNoise()
 
+
+def vis_mog(model, ep):
+    N = 1000
+    samples, labels = model.prior.zfprior.sample([N], labels=True)
+    samples = samples.detach().cpu().numpy()
+
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(samples)
+
+    plt.figure(figsize=(10, 7))
+    for label in np.unique(labels):
+        plt.scatter(X_pca[labels == label, 0], X_pca[labels == label, 1], label=f'Component {label + 1}')
+    plt.xlabel('Principal Component 1')
+    plt.ylabel('Principal Component 2')
+    plt.title('PCA of Gaussian Mixture')
+    plt.savefig(f"artifacts/PCA_{model.__class__.__name__}_{ep}.pdf")
+
+
 t0 = time.time()
 for epoch in range(1, args.epochs + 1):
     train_loss = 0.
@@ -181,18 +204,18 @@ for epoch in range(1, args.epochs + 1):
         y = y.to(device)
         masks = batch['masks']['svhn']
         n_sup = (masks).sum().item()
-        print(n_sup)
 
         log_det, z = model.flow(x)
 
         log_prior = torch.ones((x.size(0),)).to(x.device)
         if n_sup != z.shape[0]:
-            log_prior[~masks] = model.prior.log_prob(z[~masks])
+            y_unsup_onehot = torch.nn.functional.one_hot(y[~masks].to(x.device), num_classes=len(c))
+            y_unsup = y_unsup_onehot.clone().detach().float().requires_grad_(True)
+            log_prior[~masks] = model.prior.log_prob(z[~masks]) + model.prior.log_prob_y(y_unsup, device=device)
         if n_sup != 0:
             y_sup_onehot = torch.nn.functional.one_hot(y[masks].to(x.device), num_classes=len(c))
             y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
             log_prior[masks] = model.prior.log_prob(z[masks], y=y_sup)
-            # log_prior[y != -1] = model.prior.log_prob(z[y != -1], y=y[y != -1].to(x.device))
         elbo = log_det + log_prior
 
         weights = torch.ones((elbo.size(0),)).to(elbo)
@@ -222,6 +245,15 @@ for epoch in range(1, args.epochs + 1):
 
     train_loss /= len(incomplete_dataloader.dataset)
     lr_scheduler.step()
+
+    y_test = torch.Tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).long()
+    y_test = torch.nn.functional.one_hot(y_test.to(x.device), num_classes=len(c))
+    x_test = model.conditional_sample(y_test, device=device).detach().cpu().numpy()
+    if not np.any(np.isnan(x_test)):
+        plt.imshow(utils.viz_array_grid(x_test, 2, 5))
+        plt.savefig(f"artifacts/test_{epoch}.pdf")
+
+    vis_mog(model, epoch)
 
     if epoch % args.log_each == 0 or epoch == 1:
         with torch.no_grad():

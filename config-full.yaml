@@ -1,4 +1,4 @@
-cl_weight: 0.0
+cl_weight: 1.0
 clip_gn: 100.0
 config_file: ''
 conv: full
@@ -23,7 +23,7 @@ pretrained: ''
 root: ''
 seed: 0
 ssl_conv: full
-ssl_dim: 196
+ssl_dim: 782
 ssl_hd: 256
 ssl_hh: 2
 ssl_k: 4

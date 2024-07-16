@@ -11,11 +11,11 @@ import warnings
 import torch.nn.functional as F
 import argparse
 import matplotlib.pyplot as plt
-import timm
-from multivae.data.datasets import MnistSvhn
+import train_vae_svhn
 from torch.utils.data import DataLoader
+from multivae.data.datasets import MnistSvhn
 from multivae.data.utils import set_inputs_to_device
-from sklearn.decomposition import PCA
+import timm
 
 
 def get_metrics(model, loader):
@@ -56,7 +56,7 @@ parser.add_argument('--k', default=4, type=int)
 parser.add_argument('--l', default=2, type=int)
 parser.add_argument('--hid_dim', type=int, nargs='*', default=[])
 # Prior
-parser.add_argument('--ssl_model', default='cond-flow')
+parser.add_argument('--ssl_model', default='cond-flow-raw')
 parser.add_argument('--ssl_dim', default=-1, type=int)
 parser.add_argument('--ssl_l', default=2, type=int)
 parser.add_argument('--ssl_k', default=3, type=int)
@@ -99,22 +99,36 @@ if args.ssl_dim == -1:
     args.ssl_dim = dim
 deep_prior = distributions.GaussianDiag(args.ssl_dim)
 shallow_prior = distributions.GaussianDiag(dim - args.ssl_dim)
-zfprior = distributions.GmmPrior(10, args.ssl_dim)
 
+LATENT = 20
+
+
+
+incomplete_dataset = utils.restore_incomplete_dataset(0.001, '')
+
+incomplete_dataloader = DataLoader(
+            dataset=incomplete_dataset,
+            batch_size=2,
+            num_workers=8,
+            shuffle=True,
+        )
 _, c = np.unique(trainloader.dataset.targets[trainloader.dataset.targets != -1], return_counts=True)
 # yprior = torch.distributions.Categorical(probs=torch.FloatTensor(c/c.sum()).to(device))
 yprior = flows.ArbitraryConditionalPrior(counts=torch.FloatTensor(c/c.sum()), device=device)
+zfprior = distributions.GmmPrior(10, args.ssl_dim)
 ssl_flow = utils.create_cond_flow(args)
 # ssl_flow = torch.nn.DataParallel(ssl_flow.to(device))
 ssl_flow.to(device)
+
 
 # prior = flows.DiscreteConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
 #                                          shallow_prior=shallow_prior)
 # prior = flows.ArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
 #                                          shallow_prior=shallow_prior)
+# prior = flows.RawConditionalFlowPDF(ssl_flow, deep_prior, yprior, deep_dim=args.ssl_dim,
+#                                          shallow_prior=shallow_prior)
 prior = flows.MoGArbitraryConditionalFlowPDF(ssl_flow, deep_prior, yprior, zfprior, deep_dim=args.ssl_dim,
                                          shallow_prior=shallow_prior)
-
 flow = utils.create_flow(args, data_shape)
 flow.to(device)
 flow = torch.nn.DataParallel(flow.to(device))
@@ -141,6 +155,7 @@ if args.pretrained != '':
     # model.load_state_dict(torch.load(os.path.join(args.pretrained, 'model.torch')))
     # optimizer.load_state_dict(torch.load(os.path.join(args.pretrained, 'optimizer.torch')))
 
+
 # Pretrained MNIST classifier
 clf = timm.create_model("resnet18", pretrained=False, num_classes=10)
 clf.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -153,22 +168,12 @@ clf.load_state_dict(
 )
 clf = clf.to(device)
 
+
 # Dataset
 DATA_PATH = './MNIST-SVHN'
 test_set = MnistSvhn(data_path = DATA_PATH, split="test", data_multiplication=1, download=True)
 test_dataloader = DataLoader(test_set, batch_size=64, shuffle=False)
 
-print(f"test : {len(test_set)}")
-
-
-incomplete_dataset = utils.restore_incomplete_dataset(1, '_full')
-
-incomplete_dataloader = DataLoader(
-            dataset=incomplete_dataset,
-            batch_size=2,
-            num_workers=8,
-            shuffle=True,
-        )
 
 class UniformNoise(object):
     def __init__(self, bits=256):
@@ -188,65 +193,39 @@ apply_noise = UniformNoise()
 for i, batch in enumerate(incomplete_dataloader):
     x = apply_noise(batch['data']['mnist'])
     x = x.to(device)
-    y = batch['labels']
+    y = batch['data']['svhn']
     y = y.to(device)
+    labels = batch['labels']
     masks = batch['masks']['svhn']
     n_sup = (masks).sum().item()
 
     log_det, z = model.flow(x)
-    y_sup_onehot = torch.nn.functional.one_hot(y.to(x.device), num_classes=len(c))
-    y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
-    model.prior.log_prob(z, y_sup)
+    model.prior.log_prob(z, y)
 
     log_prior = torch.ones((x.size(0),)).to(x.device)
     if n_sup != z.shape[0]:
         log_prior[~masks] = model.prior.log_prob(z[~masks])
     if n_sup != 0:
-        y_sup_onehot = torch.nn.functional.one_hot(y[masks].to(x.device), num_classes=len(c))
-        y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
-        log_prior[masks] = model.prior.log_prob(z[masks], y=y_sup)
+        log_prior[masks] = model.prior.log_prob(z[masks], y=y[masks])
     break
-    
+
 
 correct, count = 0, 0
 for i, batch in enumerate(test_dataloader):
     batch = set_inputs_to_device(batch, device='cuda')
-    y = batch['labels']
-    y_sup_onehot = torch.nn.functional.one_hot(y.to(device), num_classes=len(c))
-    y_sup = y_sup_onehot.clone().detach().float().requires_grad_(True)
-    x_res = model.conditional_sample(y_sup, device=device)
-    correct += sum(clf(x_res).argmax(1) == y_sup.argmax(1)).tolist()
-    count += len(y_sup.argmax(1).tolist())
 
+    y = batch['data']['svhn']
+    labels = batch['labels']
+
+    x_mnist = model.conditional_sample(y, device=device)
+
+    correct += sum(clf(x_mnist).argmax(1) == labels).tolist()
+    count += len(labels.tolist())
     if i == 0:
-        x_test = x_res[:64].detach().cpu().numpy()
+        print('Ground truth', labels.tolist()[:64])
+        x_test = x_mnist[:64].detach().cpu().numpy()
         if not np.any(np.isnan(x_test)):
             plt.imshow(utils.viz_array_grid(x_test, 8, 8))
             plt.savefig(f"eval_{model.__class__.__name__}.pdf")
 
 print('Total test accuracy:', correct / count)
-
-# Sample from the GMM prior
-x_test = model.zf_sample(device=device).detach().cpu().numpy()
-x_test = np.nan_to_num(x_test, nan=0)
-plt.imshow(utils.viz_array_grid(x_test, 5, 2))
-plt.savefig(f"zf_prior_means_{model.__class__.__name__}.pdf")
-
-def vis_mog(model, ep):
-    N = 1000
-    samples, labels = model.prior.zfprior.sample([N], labels=True)
-    samples = samples.detach().cpu().numpy()
-
-    pca = PCA(n_components=2)
-    X_pca = pca.fit_transform(samples)
-
-    # Step 4: Plot the transformed data
-    plt.figure(figsize=(10, 7))
-    for label in np.unique(labels):
-        plt.scatter(X_pca[labels == label, 0], X_pca[labels == label, 1], label=f'Component {label + 1}')
-    plt.xlabel('Principal Component 1')
-    plt.ylabel('Principal Component 2')
-    plt.title('PCA of Gaussian Mixture')
-    plt.savefig(f"PCA_{model.__class__.__name__}_{ep}.pdf")
-
-vis_mog(model, 'eval')

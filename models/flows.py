@@ -9,6 +9,7 @@ from models.utils import Conv2dZeros, SpaceToDepth, FactorOut, ToLogits, CondToL
 from models.utils import DummyCond, IdFunction
 import warnings
 from pythae.models.base.base_model import BaseEncoder
+from models.distributions import GmmPrior
 
 DIMS_RAW = 100
 DIMS = 10
@@ -83,6 +84,9 @@ class DiscreteConditionalFlowNoEmb(ConditionalFlow):
     def __init__(self, modules, num_cat, emb_dim):
         super().__init__(modules)
 
+    def embeddings(self, y):
+        return y
+
     def f(self, x, y):
         return super().f(x, y)
 
@@ -122,6 +126,16 @@ class FlowPDF(nn.Module):
         sigma1 = torch.exp(self.prior.deep_prior.logsigma)
         z_h = torch.normal(mean1.repeat([N, 1]), sigma1.repeat([N, 1])).to(device)
         z_f = self.prior.flow.g(z_h, y)[:, :, 0, 0]
+        mean2 = self.prior.shallow_prior.mean
+        sigma2 = torch.exp(self.prior.shallow_prior.logsigma)
+        z_aux = torch.normal(mean2.repeat([N, 1]), sigma2.repeat([N, 1])).to(device)
+        x = self.flow.module.g(torch.cat([z_aux, z_f], 1))
+        return x
+
+    def zf_sample(self, device):
+        z_f = self.prior.zfprior.means
+        N = z_f.shape[0]
+        z_f = self.prior.zfprior.sample([N])
         mean2 = self.prior.shallow_prior.mean
         sigma2 = torch.exp(self.prior.shallow_prior.logsigma)
         z_aux = torch.normal(mean2.repeat([N, 1]), sigma2.repeat([N, 1])).to(device)
@@ -269,6 +283,67 @@ class ArbitraryConditionalFlowPDF(DiscreteConditionalFlowPDF):
         y = y.clone().detach().float().requires_grad_(True)
         logp = self.log_prob(x.repeat([n_uniq] + [1]*(len(x.shape)-1)), y)
         return logp.reshape((n_uniq, x.size(0))).t() + self.yprior.log_prob(sup[None])
+
+
+class MoGArbitraryConditionalFlowPDF(DiscreteConditionalFlowPDF):
+    def __init__(self, flow, deep_prior, yprior, zfprior, deep_dim, shallow_prior=None):
+        super().__init__(flow, deep_prior, yprior, deep_dim, shallow_prior=shallow_prior)
+        self.flow = flow
+        self.shallow_prior = shallow_prior
+        self.deep_prior = deep_prior
+        self.yprior = yprior
+        self.zfprior = zfprior
+        self.deep_dim = deep_dim
+
+    def log_prob_full(self, x):
+        x_zf = x[:, -self.deep_dim:].squeeze()
+        return self.zfprior.log_prob_full(x_zf)
+
+    def log_prob(self, x, y=None):
+        if y is not None:
+            return self.log_prob_xy(x, y)
+        else:
+            return self.log_prob_x(x)
+
+    def log_prob_posterior(self, x):
+        logp_joint = self.log_prob_full(x)
+        return logp_joint - torch.logsumexp(logp_joint, dim=1)[:, None]
+
+    def log_prob_x(self, x):
+        x_pr = x[:, :-self.deep_dim].squeeze()
+        x_zf = x[:, -self.deep_dim:].squeeze()
+        return self.zfprior.log_prob(x_zf) + self.shallow_prior.log_prob(x_pr)
+
+    def log_prob_xy(self, x, y):
+        if x.dim() == 2:
+            x = x[..., None, None]
+        if self.deep_dim == x.shape[1]:
+            log_det, z = self.flow(x, y)
+            return log_det + self.deep_prior.log_prob(z) + self.prob_label(x, y.argmax(1))
+        else:
+            log_det, z = self.flow(x[:, -self.deep_dim:], y)
+            x_sq = x[:, :-self.deep_dim].squeeze()
+            x_zf = x[:, -self.deep_dim:].squeeze()
+            if len(x_sq.shape) == 1:
+                x_sq = x_sq.unsqueeze(0)
+            if len(x_zf.shape) == 1:
+                x_zf = x_zf.unsqueeze(0)
+            return log_det + self.deep_prior.log_prob(z) + self.prob_label(x_zf, y.argmax(1)) + self.shallow_prior.log_prob(x_sq)
+
+    def prob_label(self, x, labels):
+        pr = self.zfprior.log_prob_full_fast(x)
+        return pr[range(x.shape[0]), labels]
+
+    def log_prob_joint(self, x, y):
+        return self.log_prob(x, y) + self.yprior.log_prob(y)
+
+    def log_prob_y(self, y, device):
+        N = y.shape[0]
+        mean1 = self.deep_prior.mean
+        sigma1 = torch.exp(self.deep_prior.logsigma)
+        z_h = torch.normal(mean1.repeat([N, 1]), sigma1.repeat([N, 1])).to(device)
+        z_f = self.flow.g(z_h, y)[:, :, 0, 0]
+        return self.prob_label(z_f, y.argmax(1)) + self.yprior.log_prob(y)
 
 
 class ResNetBlock(nn.Module):
